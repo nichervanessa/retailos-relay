@@ -1,0 +1,31 @@
+# Render Blueprint — Firebase privilege relay ONLY.
+#
+# This repository contains the relay and nothing else. No pharmacy source
+# code, no models, no business logic — just the small service that holds the
+# Firebase service-account key so customer installers never have to.
+#
+# On Render:  New → Blueprint → pick this repository.
+#
+# Two things are NOT in this file and must be set in the Render dashboard,
+# because neither belongs in a git repository:
+#
+#   1. Secret File   firebase_service_account.json   (mounts at /etc/secrets/)
+#   2. Env var       RELAY_SECRET                    (marked sync:false below)
+#
+# See README.md for the click-by-click steps.
+
+services:
+  - type: web
+    name: pharmacy-relay
+    runtime: python
+    plan: free                 # "starter" ($7/mo) stops the instance sleeping
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.4"
+      - key: FIREBASE_SERVICE_ACCOUNT
+        value: /etc/secrets/firebase_service_account.json
+      - key: RELAY_SECRET
+        sync: false            # set by hand in the dashboard; never committed

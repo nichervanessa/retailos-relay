@@ -1,0 +1,17 @@
+# ── NEVER COMMIT THESE ───────────────────────────────────────────────────────
+# The service-account key is uploaded to Render as a Secret File, by hand,
+# in the dashboard. It must never enter this repository — a key that has been
+# pushed to GitHub is compromised even if the repo is private and even if you
+# delete the commit afterwards, because it stays in the history.
+firebase_service_account.json
+serviceAccountKey.json
+*.json.key
+.env
+*.env
+
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+SECRET.txt
