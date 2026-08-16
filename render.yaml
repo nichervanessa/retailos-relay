@@ -18,7 +18,11 @@ services:
   - type: web
     name: pharmacy-relay
     runtime: python
-    plan: free                 # "starter" ($7/mo) stops the instance sleeping
+    # "starter" (~$7/mo) stops the instance sleeping. On free, the first
+    # request after ~15 minutes of quiet spends most of a minute waking up —
+    # survivable for the background sync, which retries, but a poor experience
+    # for a pharmacist sitting on the activation screen.
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
@@ -29,3 +33,11 @@ services:
         value: /etc/secrets/firebase_service_account.json
       - key: RELAY_SECRET
         sync: false            # set by hand in the dashboard; never committed
+      # Set ONLY while rotating the shared secret. The secret is baked into
+      # each desktop build, so changing it invalidates every installer already
+      # in the field; accepting the previous one for a few days turns that
+      # cliff into a staged change. Clear it once customers have updated —
+      # the log prints a line whenever a request arrives on the old secret,
+      # so it tells you when nobody is using it any more.
+      - key: RELAY_SECRET_PREVIOUS
+        sync: false
