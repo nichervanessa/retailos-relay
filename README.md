@@ -82,13 +82,24 @@ curl https://retailos-relay.onrender.com/health
 ```
 
 ```json
-{"status":"healthy","configured":true,"project":"retail-pos-ee168",
+{"status":"healthy","configured":true,"key_present":true,"project":"retail-pos-ee168",
  "project_expected":"retail-pos-ee168","project_ok":true,"version":"2.1.0"}
 ```
 
-`configured` false — `RELAY_SECRET` is not set. `project` empty — the Secret File is not
-mounted, or is not the service-account JSON. `project_ok` false — the key belongs to another
-project, and activation will fail with "Invalid activation code" until it is replaced.
+Anything other than `"status":"healthy"` is answered by the other fields:
+
+| Field | What it means when it is wrong |
+|---|---|
+| `configured: false` | `RELAY_SECRET` is not set. Every request will be refused. |
+| `key_present: false` | No Secret File. The relay is up and refuses privileged requests with a 503 that says so. |
+| `project: ""` | The file is mounted but is not a service-account JSON — paste the whole file Firebase downloaded. |
+| `project_ok: false` | The key belongs to a different project. Activation will report "Invalid activation code" for valid codes until it is replaced. |
+
+**The relay stays up in all of those states, on purpose.** It has to: a new service exists
+before there is anywhere to upload a secret file to, and a service that exits on a missing key
+takes `/health` down with it — so the one thing that could tell you what is missing is
+unreachable exactly when you need it. An earlier version did exit, and the log said
+`FileNotFoundError` instead of "upload the key".
 
 ### 6. Point the desktop app at it, and build
 
@@ -111,6 +122,16 @@ to wake. The desktop app retries once with a longer timeout for exactly this rea
 background sync copes — but somebody sitting on the activation screen waits. If customers
 activate during the working day, the paid plan (~$7/mo) is the difference between "it worked"
 and "it timed out, try again".
+
+## When the deploy log says `FileNotFoundError: /etc/secrets/firebase_service_account.json`
+
+The Secret File has not been uploaded yet — step 3. Nothing is wrong with the code or the
+blueprint; the service simply has no key. Upload it and Render redeploys by itself.
+
+On version 2.1.0 and later the service no longer exits when this happens: it comes up,
+`/health` reports `key_present: false`, and privileged requests get a 503 naming the file to
+upload. If you are still seeing the process exit, the deployed commit is older than 2.1.0 —
+push and let it redeploy.
 
 ## When activation says "Invalid activation code"
 

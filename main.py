@@ -127,7 +127,33 @@ def key_project() -> str:
 EXPECTED_PROJECT = (os.getenv("FIREBASE_PROJECT_ID") or "").strip()
 
 
+def key_present() -> bool:
+    try:
+        return os.path.isfile(SERVICE_ACCOUNT)
+    except Exception:
+        return False
+
+
 def _init() -> None:
+    """Bring up the Firebase SDK, lazily, and refuse clearly without a key.
+
+    A missing key is a DEPLOYMENT state, not a crash. It is what every new
+    service looks like between "create from blueprint" and "upload the Secret
+    File", and the two cannot be done in the other order — Render has nowhere to
+    put a secret file until the service exists.
+
+    So this must not be fatal. It used to be: initialize_app was called from the
+    startup hook, the missing file raised FileNotFoundError, and the whole
+    process exited — over and over. Which means /health was unreachable exactly
+    when somebody needed it to ask what was missing, and the log said
+    "FileNotFoundError" instead of "upload the key".
+    """
+    if not key_present():
+        raise HTTPException(503, (
+            f"This relay has no service-account key. Upload one as a Render "
+            f"Secret File named firebase_service_account.json (it mounts at "
+            f"{SERVICE_ACCOUNT}), then redeploy."
+        ))
     if not firebase_admin._apps:
         firebase_admin.initialize_app(credentials.Certificate(SERVICE_ACCOUNT))
 
@@ -141,14 +167,22 @@ def _startup() -> None:
             "RELAY_SECRET_PREVIOUS is set — a secret rotation is in progress. "
             "Clear it once the updated build has reached every customer."
         )
-    _init()
+    # Deliberately NOT fatal, and deliberately not _init() — see _init.
+    # The service has to come up so that /health can say what is wrong.
     project = key_project()
-    logger.info("Relay ready. Firebase project: %s. Allowed collections: %s",
-                project or "UNKNOWN", sorted(ALLOWED_COLLECTIONS))
-    if not project:
-        logger.warning(
-            "No project id could be read from %s — check the Secret File is "
-            "mounted and is the service-account JSON.", SERVICE_ACCOUNT)
+    logger.info("Relay starting. Firebase project: %s. Allowed collections: %s",
+                project or "NONE", sorted(ALLOWED_COLLECTIONS))
+    if not key_present():
+        logger.error(
+            "NO SERVICE-ACCOUNT KEY at %s. The relay is up and will refuse every "
+            "privileged request with a 503 until one is there. Upload it as a "
+            "Render Secret File named firebase_service_account.json, then "
+            "redeploy. /health reports this too.", SERVICE_ACCOUNT)
+    elif not project:
+        logger.error(
+            "The file at %s is not a service-account JSON — no project_id in it. "
+            "Paste the whole file Firebase downloaded, not a fragment.",
+            SERVICE_ACCOUNT)
     elif EXPECTED_PROJECT and project != EXPECTED_PROJECT:
         logger.error(
             "PROJECT MISMATCH: this relay holds a key for '%s', but "
@@ -656,13 +690,20 @@ def health():
     health check said so. Now one does.
     """
     project = key_project()
+    have_key = key_present()
+    # Set FIREBASE_PROJECT_ID on the service and this becomes a verdict rather
+    # than a fact somebody has to know how to read.
+    project_ok = (not EXPECTED_PROJECT) or project == EXPECTED_PROJECT
     return {
-        "status": "healthy",
+        # "degraded" rather than a 500: the service IS answering, and what it
+        # cannot do is something to fix in a dashboard. A relay serving the wrong
+        # project counts as degraded — it is the failure that otherwise looks
+        # like perfect health right up until a customer cannot activate.
+        "status": "healthy" if (have_key and project and project_ok) else "degraded",
         "configured": bool(RELAY_SECRET),
+        "key_present": have_key,
         "project": project,
-        # Set FIREBASE_PROJECT_ID on the service and this becomes a verdict
-        # rather than a fact somebody has to know how to read.
         "project_expected": EXPECTED_PROJECT,
-        "project_ok": (not EXPECTED_PROJECT) or project == EXPECTED_PROJECT,
+        "project_ok": project_ok,
         "version": app.version,
     }
