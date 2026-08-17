@@ -1,13 +1,18 @@
-# Firebase privilege relay
+# RetailOS Pro — Firebase privilege relay
 
 Holds the Firebase service-account private key so the desktop installer never has to.
+
+**This is its own service, for its own Firebase project.** It is not the pharmacy relay and
+must not share a deployment with it: the two hold keys for different Firebase projects, and a
+relay pointed at the wrong project reports every valid activation code as invalid. See
+**Deploy on Render** below, and check `/health` after every deploy.
 
 ## Why
 
 Before this service, `firebase_service_account.json` was copied into every customer's
 installation. That file is the master key to the Firebase project. Anyone who extracted it
 could create their own admin accounts, forge activation codes, and read every other
-pharmacy's synced dashboard. Because it shipped inside the app, it had to be assumed public.
+shop's synced dashboard. Because it shipped inside the app, it had to be assumed public.
 
 The relay keeps the key on a server you control. The desktop app asks for the specific
 operation it needs and receives only that result.
@@ -28,33 +33,99 @@ These three features need the relay (or a local key on a developer machine):
 
 ## Deploy on Render
 
-The blueprint in `../render.yaml` already defines this service.
+Fifteen minutes, once. Everything below happens in the Render and Firebase dashboards —
+nothing is committed, because none of it belongs in a git repository.
 
-1. **Push the repository** to GitHub, then in Render choose **New → Blueprint** and pick it.
-2. **Upload the key.** In the `pharmacy-relay` service → *Environment* → *Secret Files*, add a
-   file named `firebase_service_account.json` containing your service account JSON. It mounts
-   at `/etc/secrets/firebase_service_account.json`.
-3. **Set the shared secret.** Generate a long random string:
+### 1. Get the key for the RIGHT project
 
-   ```bash
-   python -c "import secrets; print(secrets.token_urlsafe(48))"
-   ```
+Firebase Console → pick the project the app verifies against — **retail-pos-ee168** for
+RetailOS Pro → gear icon → **Project settings** → **Service accounts** → **Generate new
+private key**. A `.json` file downloads. Keep it out of this repository and off any shared
+drive.
 
-   Set it as `RELAY_SECRET` on the relay service.
-4. **Point the desktop app at it.** In `electron/main.js` the backend inherits `RELAY_URL` and
-   `RELAY_SECRET` from the environment, so set both when building a release:
+This step decides whether activation works at all. A key from any other project produces a
+relay that answers every request politely and finds nothing.
 
-   ```
-   RELAY_URL=https://pharmacy-relay.onrender.com
-   RELAY_SECRET=<the same value>
-   ```
+### 2. Create the service
 
-5. **Verify.** `curl https://pharmacy-relay.onrender.com/health` should return
-   `{"status":"healthy","configured":true}`, and the desktop `/health` should report
-   `"privileged_mode":"relay"`.
+Push this repository to GitHub, then on Render: **New → Blueprint**, and pick
+`nichervanessa/retailos-relay`. The blueprint in `render.yaml` names the service
+`retailos-relay` and sets the health check.
 
-Use a paid Render plan, or the free instance sleeps and the first activation of the day
-times out.
+If you already run the pharmacy relay, **create this as a separate service and leave that one
+running.** Pharmacy installations already in the field have its address baked into their
+build; taking it down stops them creating staff accounts and activating.
+
+### 3. Upload the key
+
+Service → **Environment** → **Secret Files** → **Add Secret File**:
+
+| | |
+|---|---|
+| Filename | `firebase_service_account.json` |
+| Contents | paste the whole JSON file from step 1 |
+
+It mounts at `/etc/secrets/firebase_service_account.json`, where `FIREBASE_SERVICE_ACCOUNT`
+already points.
+
+### 4. Set two environment variables
+
+| Key | Value |
+|---|---|
+| `RELAY_SECRET` | a long random string. Generate it and never reuse one that has been pasted into a chat, an email or a terminal you have shared: `python -c "import secrets; print(secrets.token_urlsafe(48))"` |
+| `FIREBASE_PROJECT_ID` | `retail-pos-ee168` — the project you expect. The relay logs an error at startup and `/health` reports `project_ok: false` if the uploaded key disagrees. |
+
+### 5. Verify before touching the app
+
+```bash
+curl https://retailos-relay.onrender.com/health
+```
+
+```json
+{"status":"healthy","configured":true,"project":"retail-pos-ee168",
+ "project_expected":"retail-pos-ee168","project_ok":true,"version":"2.1.0"}
+```
+
+`configured` false — `RELAY_SECRET` is not set. `project` empty — the Secret File is not
+mounted, or is not the service-account JSON. `project_ok` false — the key belongs to another
+project, and activation will fail with "Invalid activation code" until it is replaced.
+
+### 6. Point the desktop app at it, and build
+
+`npm run relay-config` bakes `RELAY_URL` into the build; the backend inherits `RELAY_SECRET`.
+In PowerShell, from the app folder:
+
+```powershell
+$env:RELAY_URL="https://retailos-relay.onrender.com"
+$env:RELAY_SECRET="<the same value you set on Render>"
+npm run electron-publish
+```
+
+On a machine running the new build, the desktop `/health` should report
+`"privileged_mode":"relay"`.
+
+### The free plan sleeps
+
+Render's free instance stops after about fifteen minutes of quiet and takes most of a minute
+to wake. The desktop app retries once with a longer timeout for exactly this reason, so
+background sync copes — but somebody sitting on the activation screen waits. If customers
+activate during the working day, the paid plan (~$7/mo) is the difference between "it worked"
+and "it timed out, try again".
+
+## When activation says "Invalid activation code"
+
+One message, four causes. In the order worth checking:
+
+1. **The relay holds the wrong project's key.** `curl .../health` and read `project`. The
+   control panel writes codes into its own project; the relay looks in the project its key
+   belongs to. Different projects, and a perfectly valid code is simply not there. This is
+   the cause that looks like every other cause, which is why `/health` now reports it.
+2. **The code was never written**, or was written by a control panel signed in to a different
+   project. Look for the exact 16 characters in the `activationCodes` collection in the
+   Firebase console.
+3. **Already used, revoked or expired** — each of those has its own message, so if you are
+   reading "invalid", it is none of them.
+4. **Not 16 alphanumeric characters** — refused without a lookup.
 
 ## How requests are authorised
 
@@ -64,7 +135,7 @@ times out.
 2. **Caller identity** — every operation that touches an account requires the caller's own
    Firebase ID token, verified here.
 3. **Entitlement** — what a caller may then do is read from data only the control panel can
-   write. An admin may manage accounts within their own pharmacy (`created_by` / `account`
+   write. An admin may manage accounts within their own shop (`created_by` / `account`
    claims); nobody may reach across into another customer's.
 4. **Collection allow-list** — Firestore access is restricted to `accounts`,
    `activationCodes` and `mobile_dashboard`, each with its own rule. Activation codes are no
@@ -78,7 +149,7 @@ times out.
 The version of this service shipped before v2.0.0 broke that rule twice. `user.set_claims`
 accepted any caller setting claims on their **own** uid — so a cashier could name themselves
 admin, on any install in the customer base, and then list, create and delete accounts across
-every pharmacy sharing the project. It also accepted a request with **no caller at all** so
+every shop sharing the project. It also accepted a request with **no caller at all** so
 long as the role being granted was `admin`, on the strength of a comment saying the desktop
 backend had checked an activation code first. The relay never verified that, and could not:
 the check sat on the far side of a boundary the attacker controls.
@@ -93,7 +164,7 @@ for themselves:
 | `account.claim_admin` | the caller's verified ID token matching an `accounts` document by `adminUid`, or by **verified** email | the **caller**, and only the caller |
 
 Neither lets a client name a role or a target. `user.set_claims` now requires an admin
-caller and refuses accounts belonging to another pharmacy.
+caller and refuses accounts belonging to another shop.
 
 ### Known residual risk
 
@@ -156,7 +227,7 @@ yourself — is worth investigating.
 ## Run locally
 
 ```bash
-cd relay
+cd retailos-relay
 pip install -r requirements.txt
 export RELAY_SECRET=dev-secret
 export FIREBASE_SERVICE_ACCOUNT=../backend/firebase_service_account.json

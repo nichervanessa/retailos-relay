@@ -12,7 +12,7 @@ staff accounts, setting role claims, and reading/writing a few Firestore
 documents. Performing those locally means shipping the service-account private
 key inside every customer's installer — and anyone who extracts that key gains
 total control of the Firebase project: minting themselves admin accounts,
-forging activation codes, and reading every other pharmacy's data.
+forging activation codes, and reading every other shop's data.
 
 This relay keeps the key in one place you control. The desktop app calls it
 over HTTPS and gets back only the specific result it asked for.
@@ -89,9 +89,42 @@ ALLOWED_COLLECTIONS = {"accounts", "activationCodes", "mobile_dashboard"}
 # escalation surface and a way to push a token past Firebase's 1000-byte claim
 # limit and lock an account out of logging in entirely.
 ALLOWED_CLAIM_KEYS = {"role", "created_by", "account"}
-ALLOWED_ROLES = {"admin", "cashier", "pharmacist", "warehouse"}
+ALLOWED_ROLES = {"admin", "cashier", "accountant", "warehouse"}
 
-app = FastAPI(title="Pharmacy Firebase Relay", version="2.0.0")
+app = FastAPI(title="RetailOS Firebase Relay", version="2.1.0")
+
+
+# ── Why FieldFilter and not .where(field, "==", value) ──────────────────────
+# google-cloud-firestore deprecated the positional form and warns on every call:
+#
+#   UserWarning: Detected filter using positional arguments. Prefer using the
+#   'filter' keyword argument instead.
+#
+# It printed once per query into the shop's log, which is how a real error gets
+# lost. The keyword form is the supported one and behaves identically.
+def _eq(field: str, value):
+    """An equality filter, in the form the library actually wants."""
+    from google.cloud.firestore_v1.base_query import FieldFilter
+    return FieldFilter(field, "==", value)
+
+
+def key_project() -> str:
+    """Which Firebase project the mounted key belongs to. Empty if unreadable."""
+    try:
+        import json as _json
+        with open(SERVICE_ACCOUNT, "r", encoding="utf-8") as fh:
+            return str(_json.load(fh).get("project_id") or "")
+    except Exception:
+        return ""             # no key mounted yet, or not a service-account file
+
+
+# The project this relay is MEANT to serve, set on the service.
+#
+# /health already reports which project the key belongs to, but only somebody
+# who thinks to look will see it. This turns the mismatch into a line in the
+# deploy log at the moment it becomes true, which is the moment it is cheap to
+# fix — rather than a fortnight later when a customer cannot activate.
+EXPECTED_PROJECT = (os.getenv("FIREBASE_PROJECT_ID") or "").strip()
 
 
 def _init() -> None:
@@ -109,7 +142,20 @@ def _startup() -> None:
             "Clear it once the updated build has reached every customer."
         )
     _init()
-    logger.info("Relay ready. Allowed collections: %s", sorted(ALLOWED_COLLECTIONS))
+    project = key_project()
+    logger.info("Relay ready. Firebase project: %s. Allowed collections: %s",
+                project or "UNKNOWN", sorted(ALLOWED_COLLECTIONS))
+    if not project:
+        logger.warning(
+            "No project id could be read from %s — check the Secret File is "
+            "mounted and is the service-account JSON.", SERVICE_ACCOUNT)
+    elif EXPECTED_PROJECT and project != EXPECTED_PROJECT:
+        logger.error(
+            "PROJECT MISMATCH: this relay holds a key for '%s', but "
+            "FIREBASE_PROJECT_ID says it should be serving '%s'. Activation "
+            "codes written by the control panel will not be found here, and "
+            "every customer will be told a valid code is invalid. Replace the "
+            "Secret File.", project, EXPECTED_PROJECT)
 
 
 class OpIn(BaseModel):
@@ -185,9 +231,9 @@ def _may_manage(caller: dict, uid: str, target: dict) -> bool:
     """
     Whether an admin caller may act on this account.
 
-    Every pharmacy in the customer base shares one Firebase project, so "is an
+    Every shop in the customer base shares one Firebase project, so "is an
     admin" is not by itself a reason to let somebody edit an account — it has
-    to be an admin of the SAME pharmacy. Ownership is read from claims the
+    to be an admin of the SAME shop. Ownership is read from claims the
     relay itself wrote: `created_by` (who created this staff member) and
     `account` (which panel account they belong to).
 
@@ -214,7 +260,7 @@ def _may_manage(caller: dict, uid: str, target: dict) -> bool:
 def _require_may_manage(caller: dict, uid: str) -> dict:
     target = _target_claims(uid)
     if not _may_manage(caller, uid, target):
-        raise HTTPException(403, "That account belongs to another pharmacy")
+        raise HTTPException(403, "That account belongs to another shop")
     return target
 
 
@@ -285,7 +331,7 @@ def _op_user_delete(args: dict, caller: Optional[dict]):
 def _op_user_set_claims(args: dict, caller: Optional[dict]):
     """
     Set an account's role. ADMIN CALLER ONLY, and only within their own
-    pharmacy.
+    shop.
 
     There is no bootstrap path through here any more, and that is the point.
     Becoming the first admin of an installation is not a claim change with a
@@ -413,12 +459,12 @@ def _op_account_claim_admin(args: dict, caller: Optional[dict]):
     email = str(caller.get("email") or "").strip().lower()
 
     collection = firestore.client().collection("accounts")
-    docs = list(collection.where("adminUid", "==", uid).limit(1).get())
+    docs = list(collection.where(filter=_eq("adminUid", uid)).limit(1).get())
     if not docs and email and caller.get("email_verified"):
         # Matching on the email address only when Firebase has verified it.
         # Otherwise anyone could sign up claiming a customer's address and
-        # inherit their pharmacy.
-        docs = list(collection.where("adminEmail", "==", email).limit(1).get())
+        # inherit their shop.
+        docs = list(collection.where(filter=_eq("adminEmail", email)).limit(1).get())
 
     if not docs:
         return None
@@ -462,7 +508,7 @@ def _op_fs_query(args: dict, caller: Optional[dict]):
     docs = (
         firestore.client()
         .collection(coll)
-        .where(args["field"], "==", args["value"])
+        .where(filter=_eq(args["field"], args["value"]))
         .limit(int(args.get("limit") or 1))
         .get()
     )
@@ -594,4 +640,29 @@ def run_op(
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "configured": bool(RELAY_SECRET)}
+    """
+    Unauthenticated on purpose — it is what the build script and the desktop app
+    poll before trusting this service.
+
+    `project` is here because its absence cost a day. The relay holds the key,
+    so the relay decides which Firebase project every privileged operation
+    reads. When the desktop app moved to a new project and this service was
+    still holding the old key, the control panel wrote an activation code into
+    one project and the backend asked this service to redeem it out of another.
+    The code was not found, and the customer was told "Invalid activation code"
+    about a code that was perfectly valid.
+
+    Nothing was broken. The two ends were pointed at different places, and no
+    health check said so. Now one does.
+    """
+    project = key_project()
+    return {
+        "status": "healthy",
+        "configured": bool(RELAY_SECRET),
+        "project": project,
+        # Set FIREBASE_PROJECT_ID on the service and this becomes a verdict
+        # rather than a fact somebody has to know how to read.
+        "project_expected": EXPECTED_PROJECT,
+        "project_ok": (not EXPECTED_PROJECT) or project == EXPECTED_PROJECT,
+        "version": app.version,
+    }

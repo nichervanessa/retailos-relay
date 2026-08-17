@@ -1,6 +1,6 @@
 # Render Blueprint — Firebase privilege relay ONLY.
 #
-# This repository contains the relay and nothing else. No pharmacy source
+# This repository contains the relay and nothing else. No RetailOS source
 # code, no models, no business logic — just the small service that holds the
 # Firebase service-account key so customer installers never have to.
 #
@@ -12,16 +12,23 @@
 #   1. Secret File   firebase_service_account.json   (mounts at /etc/secrets/)
 #   2. Env var       RELAY_SECRET                    (marked sync:false below)
 #
+# And one that decides whether activation works at all: the Secret File has to
+# be a key for the SAME Firebase project the app verifies against. A relay
+# holding another project's key answers every request cheerfully and finds no
+# activation codes, so every customer is told their valid code is invalid.
+# FIREBASE_PROJECT_ID below turns that silent mismatch into a startup error and
+# a `project_ok: false` in /health.
+#
 # See README.md for the click-by-click steps.
 
 services:
   - type: web
-    name: pharmacy-relay
+    name: retailos-relay
     runtime: python
     # "starter" (~$7/mo) stops the instance sleeping. On free, the first
     # request after ~15 minutes of quiet spends most of a minute waking up —
     # survivable for the background sync, which retries, but a poor experience
-    # for a pharmacist sitting on the activation screen.
+    # for somebody sitting on the activation screen waiting to start selling.
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
@@ -31,6 +38,11 @@ services:
         value: "3.12.4"
       - key: FIREBASE_SERVICE_ACCOUNT
         value: /etc/secrets/firebase_service_account.json
+      # The project this relay is EXPECTED to serve. Compared at startup with
+      # the project id inside the uploaded key; a mismatch is logged as an
+      # error and reported by /health rather than discovered by a customer.
+      - key: FIREBASE_PROJECT_ID
+        value: retail-pos-ee168
       - key: RELAY_SECRET
         sync: false            # set by hand in the dashboard; never committed
       # Set ONLY while rotating the shared secret. The secret is baked into
