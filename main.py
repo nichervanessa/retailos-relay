@@ -91,6 +91,143 @@ ALLOWED_COLLECTIONS = {"accounts", "activationCodes", "mobile_dashboard"}
 ALLOWED_CLAIM_KEYS = {"role", "created_by", "account"}
 ALLOWED_ROLES = {"admin", "cashier", "accountant", "warehouse"}
 
+# ─── Online backups (Backblaze B2, S3-compatible) ─────────────────────────────
+#
+# Every shop uploads its database here nightly, and every shop must be able to
+# see exactly one shop's backups: its own. Five hundred businesses that compete
+# with each other are in this bucket, and their cost prices and margins are in
+# those files.
+#
+# ── How the isolation actually works ────────────────────────────────────────
+# The storage prefix is derived from the `account` custom claim inside the
+# caller's Firebase ID token — a token this relay verified itself, against
+# Google's signing keys, on this request. It is never read from the request
+# body, never passed as an argument, and there is no operation that accepts one.
+# So a shop cannot ask for another shop's prefix: there is no field in which to
+# put it. That is the whole security model, and it is why every handler below
+# calls _account_of(caller) as its first act.
+#
+# The shared secret is NOT part of that boundary. It is baked into every
+# installer by design (see electron/write-relay-config.js), so anybody holding
+# a copy of the app holds it. It gates the door; the claim decides the room.
+B2_KEY_ID   = (os.getenv("B2_KEY_ID") or "").strip()
+B2_APP_KEY  = (os.getenv("B2_APP_KEY") or "").strip()
+B2_BUCKET   = (os.getenv("B2_BUCKET") or "").strip()
+B2_ENDPOINT = (os.getenv("B2_ENDPOINT") or "").strip()   # e.g. https://s3.us-west-004.backblazeb2.com
+B2_REGION   = (os.getenv("B2_REGION") or "us-west-004").strip()
+
+BACKUP_ROOT = "backups"
+
+# How many backups to keep per shop. The oldest beyond this are deleted when a
+# new upload URL is issued, so a shop that runs every night keeps a rolling
+# window rather than growing forever.
+BACKUP_KEEP = int(os.getenv("BACKUP_KEEP") or 10)
+
+# A ceiling per shop, checked before a URL is handed out. A presigned PUT does
+# not limit what the client sends, so without this one installation could fill
+# the bucket — by accident with a huge database, or on purpose.
+BACKUP_QUOTA_BYTES = int(os.getenv("BACKUP_QUOTA_BYTES") or 5 * 1024 ** 3)
+BACKUP_MAX_FILE_BYTES = int(os.getenv("BACKUP_MAX_FILE_BYTES") or 2 * 1024 ** 3)
+
+# Short on purpose. The URL is a bearer credential for one object: long enough
+# to upload a slow shop's database over a slow line, not long enough to be
+# worth passing around.
+BACKUP_URL_TTL = int(os.getenv("BACKUP_URL_TTL") or 900)
+
+# An account id becomes a path segment, so it is validated as one. Without this
+# an id containing "../" would walk out of its own prefix and into another
+# shop's — the one way the model above could be defeated from inside.
+ACCOUNT_ID_RE = __import__("re").compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+_s3_client = None
+
+
+def _s3():
+    """The B2 client, or a 503 that says which setting is missing."""
+    global _s3_client
+    missing = [n for n, v in (
+        ("B2_KEY_ID", B2_KEY_ID), ("B2_APP_KEY", B2_APP_KEY),
+        ("B2_BUCKET", B2_BUCKET), ("B2_ENDPOINT", B2_ENDPOINT),
+    ) if not v]
+    if missing:
+        raise HTTPException(503, "Online backup is not configured on the server: "
+                                 f"missing {', '.join(missing)}")
+    if _s3_client is None:
+        try:
+            import boto3
+            from botocore.config import Config
+        except ImportError:
+            raise HTTPException(503, "Online backup is not available: boto3 is not installed")
+        _s3_client = boto3.client(
+            "s3",
+            endpoint_url=B2_ENDPOINT,
+            aws_access_key_id=B2_KEY_ID,
+            aws_secret_access_key=B2_APP_KEY,
+            region_name=B2_REGION,
+            config=Config(signature_version="s3v4"),
+        )
+    return _s3_client
+
+
+def _account_of(caller: dict) -> str:
+    """
+    Which shop is asking — taken from the verified token and nowhere else.
+
+    An admin with no `account` claim is an installation that was activated
+    before the claim existed, or one that has never been activated. It is not
+    an error in their shop; it just cannot be placed in the bucket, and
+    guessing would put it in somebody else's folder.
+    """
+    account = str(caller.get("account") or "").strip()
+    if not account:
+        raise HTTPException(
+            403,
+            "This installation is not linked to a licence account yet, so there "
+            "is nowhere to put its backups. Re-enter the activation code.",
+        )
+    if not ACCOUNT_ID_RE.match(account):
+        raise HTTPException(403, "This installation's account id is not usable as a storage path")
+    return account
+
+
+def _account_prefix(account: str) -> str:
+    return f"{BACKUP_ROOT}/{account}/"
+
+
+def _list_backups(account: str) -> list:
+    """Newest first. The bucket is the index — there is no database here."""
+    prefix = _account_prefix(account)
+    items, token = [], None
+    while True:
+        kwargs = {"Bucket": B2_BUCKET, "Prefix": prefix, "MaxKeys": 1000}
+        if token:
+            kwargs["ContinuationToken"] = token
+        page = _s3().list_objects_v2(**kwargs)
+        for obj in page.get("Contents", []):
+            items.append({
+                "key": obj["Key"],
+                "size": int(obj.get("Size") or 0),
+                "modified": obj["LastModified"].isoformat() if obj.get("LastModified") else "",
+            })
+        if not page.get("IsTruncated"):
+            break
+        token = page.get("NextContinuationToken")
+    items.sort(key=lambda i: i["key"], reverse=True)
+    return items
+
+
+def _own_key_or_403(account: str, key: Any) -> str:
+    """
+    The one place a key arrives from the client, and the one place it is
+    checked. Anything not inside this shop's own prefix is refused before it
+    reaches the bucket — including the paths that look like they are.
+    """
+    key = str(key or "")
+    prefix = _account_prefix(account)
+    if ".." in key or not key.startswith(prefix) or len(key) <= len(prefix):
+        raise HTTPException(403, "That backup does not belong to this shop")
+    return key
+
 app = FastAPI(title="RetailOS Firebase Relay", version="2.1.0")
 
 
@@ -127,6 +264,49 @@ def key_project() -> str:
 EXPECTED_PROJECT = (os.getenv("FIREBASE_PROJECT_ID") or "").strip()
 
 
+def key_problem() -> str:
+    """
+    What is wrong with the mounted key, in words, or "" if it is usable.
+
+    Reports on the SHAPE of the file — whether it parses, which required fields
+    are absent — and never on their values. The one field anybody would be
+    tempted to describe is private_key, and describing it is precisely what
+    must not happen.
+
+    This exists because "present" and "usable" are different states and only
+    the first was ever checked. A file uploaded as a truncated paste satisfies
+    key_present(), then makes credentials.Certificate() raise ValueError from
+    _init() — which sits outside the try in run_op, so FastAPI answers a bare
+    500 "Internal Server Error" and the customer is told nothing at all.
+    """
+    if not key_present():
+        return f"no file is mounted at {SERVICE_ACCOUNT}"
+    try:
+        with open(SERVICE_ACCOUNT, "r", encoding="utf-8") as fh:
+            raw = fh.read()
+    except Exception as e:
+        return f"the file at {SERVICE_ACCOUNT} could not be read ({type(e).__name__})"
+    if not raw.strip():
+        return f"the file at {SERVICE_ACCOUNT} is empty"
+    try:
+        import json as _json
+        data = _json.loads(raw)
+    except Exception as e:
+        return (f"the file at {SERVICE_ACCOUNT} is not valid JSON ({e}) — "
+                "usually a truncated paste; it must start with { and end with }")
+    if not isinstance(data, dict):
+        return "the file is JSON, but not an object"
+    missing = [k for k in ("type", "project_id", "private_key", "client_email")
+               if not data.get(k)]
+    if missing:
+        return ("the file parses but is missing " + ", ".join(missing) +
+                " — paste the whole file Firebase downloaded, not a fragment")
+    if "BEGIN PRIVATE KEY" not in str(data.get("private_key") or ""):
+        return ("private_key is not a PEM block — the paste was reformatted "
+                "somewhere on the way in")
+    return ""
+
+
 def key_present() -> bool:
     try:
         return os.path.isfile(SERVICE_ACCOUNT)
@@ -154,8 +334,30 @@ def _init() -> None:
             f"Secret File named firebase_service_account.json (it mounts at "
             f"{SERVICE_ACCOUNT}), then redeploy."
         ))
+    # Present is not the same as usable, and the gap between them used to be a
+    # bare 500. Say which it is.
+    problem = key_problem()
+    if problem:
+        logger.error("service-account key unusable: %s", problem)
+        raise HTTPException(503, (
+            f"This relay's service-account key cannot be used: {problem}. "
+            f"Replace the Render Secret File named firebase_service_account.json "
+            f"and redeploy."
+        ))
     if not firebase_admin._apps:
-        firebase_admin.initialize_app(credentials.Certificate(SERVICE_ACCOUNT))
+        try:
+            firebase_admin.initialize_app(credentials.Certificate(SERVICE_ACCOUNT))
+        except Exception as e:
+            # Shape was fine, Firebase still refused it — a revoked key, or one
+            # belonging to a deleted project. The type is enough to act on; the
+            # full text goes to the log, not to the caller.
+            logger.error("Firebase refused the service-account key: %s", e, exc_info=True)
+            raise HTTPException(503, (
+                f"Firebase refused this relay's service-account key "
+                f"({type(e).__name__}). Generate a fresh key in Firebase "
+                f"Console -> Project settings -> Service accounts, upload it as "
+                f"the Secret File, and redeploy."
+            ))
 
 
 @app.on_event("startup")
@@ -471,7 +673,7 @@ def _op_activation_claim(args: dict, caller: Optional[dict]):
 
     return {
         "account_id": account_id,
-        "account_name": str(data.get("accountName") or ""),
+        "account_name": str(data.get("accountName") or data.get("name") or ""),
         "exp": str(data.get("exp") or ""),
         "limits": data.get("limits") or {},
         "admin_email": admin_email,
@@ -519,7 +721,7 @@ def _op_account_claim_admin(args: dict, caller: Optional[dict]):
         except Exception:
             pass
 
-    return {"account": doc.id, "account_name": str(data.get("accountName") or "")}
+    return {"account": doc.id, "account_name": str(data.get("accountName") or data.get("name") or "")}
 
 
 # ─── Firestore ────────────────────────────────────────────────────────────────
@@ -607,6 +809,104 @@ def _op_fs_set(args: dict, caller: Optional[dict]):
     return None
 
 
+# ─── Online backup operations ─────────────────────────────────────────────────
+# Read the block at the top of the file before changing any of these. Every one
+# of them derives its prefix from the token; none of them accepts an account.
+
+def _op_backup_upload_url(args: dict, caller: Optional[dict]):
+    """
+    Hand back a URL this shop may upload one backup to.
+
+    The bytes never pass through this service. It signs a permission slip for a
+    single object key that it chose itself, and the shop uploads straight to B2
+    — which is what makes five hundred shops on a free-tier instance possible
+    at all.
+    """
+    _require_admin(caller)
+    account = _account_of(caller)
+
+    try:
+        size = int(args.get("size") or 0)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "size must be a number")
+    if size <= 0:
+        raise HTTPException(400, "size must be the number of bytes about to be uploaded")
+    if size > BACKUP_MAX_FILE_BYTES:
+        raise HTTPException(413, "That backup is larger than this service accepts")
+
+    # Prune BEFORE the quota check, so a shop at its limit with old backups to
+    # drop is not refused for space it is about to free.
+    existing = _list_backups(account)
+    doomed = existing[max(BACKUP_KEEP - 1, 0):]
+    for item in doomed:
+        try:
+            _s3().delete_object(Bucket=B2_BUCKET, Key=item["key"])
+        except Exception as e:
+            logger.warning("could not prune %s: %s", item["key"], e)
+    kept = existing[:max(BACKUP_KEEP - 1, 0)]
+
+    used = sum(i["size"] for i in kept)
+    if used + size > BACKUP_QUOTA_BYTES:
+        raise HTTPException(
+            413,
+            "This shop has reached its online backup limit. Delete an older "
+            "backup, or ask for more space.",
+        )
+
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
+    key = f"{_account_prefix(account)}retailos-{stamp}.db.gz"
+
+    url = _s3().generate_presigned_url(
+        "put_object",
+        Params={"Bucket": B2_BUCKET, "Key": key, "ContentType": "application/gzip"},
+        ExpiresIn=BACKUP_URL_TTL,
+    )
+    return {
+        "url": url,
+        "key": key,
+        "method": "PUT",
+        "headers": {"Content-Type": "application/gzip"},
+        "expires_in": BACKUP_URL_TTL,
+        "pruned": [i["key"] for i in doomed],
+    }
+
+
+def _op_backup_list(args: dict, caller: Optional[dict]):
+    """Every backup this shop has, newest first. Never anybody else's."""
+    _require_admin(caller)
+    account = _account_of(caller)
+    items = _list_backups(account)
+    return {
+        "backups": items,
+        "keep": BACKUP_KEEP,
+        "used": sum(i["size"] for i in items),
+        "quota": BACKUP_QUOTA_BYTES,
+    }
+
+
+def _op_backup_download_url(args: dict, caller: Optional[dict]):
+    """A URL to fetch one of this shop's own backups, for a restore."""
+    _require_admin(caller)
+    account = _account_of(caller)
+    key = _own_key_or_403(account, args.get("key"))
+
+    url = _s3().generate_presigned_url(
+        "get_object",
+        Params={"Bucket": B2_BUCKET, "Key": key},
+        ExpiresIn=BACKUP_URL_TTL,
+    )
+    return {"url": url, "key": key, "expires_in": BACKUP_URL_TTL}
+
+
+def _op_backup_delete(args: dict, caller: Optional[dict]):
+    """Remove one of this shop's own backups."""
+    _require_admin(caller)
+    account = _account_of(caller)
+    key = _own_key_or_403(account, args.get("key"))
+    _s3().delete_object(Bucket=B2_BUCKET, Key=key)
+    return {"deleted": key}
+
+
 HANDLERS = {
     "user.list": _op_user_list,
     "user.get": _op_user_get,
@@ -621,6 +921,10 @@ HANDLERS = {
     "fs.query": _op_fs_query,
     "fs.update": _op_fs_update,
     "fs.set": _op_fs_set,
+    "backup.upload_url": _op_backup_upload_url,
+    "backup.list": _op_backup_list,
+    "backup.download_url": _op_backup_download_url,
+    "backup.delete": _op_backup_delete,
 }
 
 
@@ -691,6 +995,7 @@ def health():
     """
     project = key_project()
     have_key = key_present()
+    problem = key_problem()
     # Set FIREBASE_PROJECT_ID on the service and this becomes a verdict rather
     # than a fact somebody has to know how to read.
     project_ok = (not EXPECTED_PROJECT) or project == EXPECTED_PROJECT
@@ -699,9 +1004,13 @@ def health():
         # cannot do is something to fix in a dashboard. A relay serving the wrong
         # project counts as degraded — it is the failure that otherwise looks
         # like perfect health right up until a customer cannot activate.
-        "status": "healthy" if (have_key and project and project_ok) else "degraded",
+        "status": "healthy" if (not problem and project_ok) else "degraded",
         "configured": bool(RELAY_SECRET),
         "key_present": have_key,
+        # "" when the key is usable. Named as a problem rather than a boolean
+        # so the answer is the sentence somebody needs, not a flag they then
+        # have to look up.
+        "key_problem": problem,
         "project": project,
         "project_expected": EXPECTED_PROJECT,
         "project_ok": project_ok,

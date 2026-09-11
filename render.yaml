@@ -53,3 +53,29 @@ services:
       # so it tells you when nobody is using it any more.
       - key: RELAY_SECRET_PREVIOUS
         sync: false
+      # ── Online backups (Backblaze B2) ──────────────────────────────────────
+      # The bucket every shop uploads its nightly database to. Isolation is not
+      # done by these credentials — it is done in main.py, which builds each
+      # shop's storage prefix from the `account` claim inside the caller's
+      # verified Firebase token. These are the relay's own keys to the whole
+      # bucket, so the B2 application key should be scoped to THIS BUCKET ONLY
+      # and nothing else in the account.
+      #
+      # Leave them unset and the backup operations answer 503 with the name of
+      # the missing setting; everything else in the relay keeps working.
+      - key: B2_ENDPOINT
+        sync: false            # e.g. https://s3.us-west-004.backblazeb2.com
+      - key: B2_REGION
+        sync: false            # e.g. us-west-004 — must match the endpoint
+      - key: B2_BUCKET
+        sync: false
+      - key: B2_KEY_ID
+        sync: false
+      - key: B2_APP_KEY
+        sync: false
+      # How many backups to keep per shop, and the ceiling one shop may use.
+      # Both have working defaults (10 and 5 GiB); set them only to change those.
+      - key: BACKUP_KEEP
+        sync: false
+      - key: BACKUP_QUOTA_BYTES
+        sync: false
