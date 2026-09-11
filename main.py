@@ -330,17 +330,28 @@ def _describe_key_id() -> str:
         notes.append("it contains ':' or '=' — paste only the id itself, not a label")
 
     stripped = value.strip("'\"")
-    if stripped.startswith("K") and len(stripped) > 27:
+
+    # The reliable difference, and it is not the leading K — Backblaze's own
+    # documented example applicationKey is "N2Zug0evLcHDlh_L0Z0AJhiGGdY", no K
+    # in sight. What holds is the ALPHABET: a keyID is 25 lowercase hex
+    # characters, and an applicationKey is mixed case with underscores in it.
+    # Anything with a capital letter or an underscore is not a key id.
+    is_hex = stripped and all(c in "0123456789abcdef" for c in stripped)
+
+    if stripped and not is_hex:
         notes.append(
-            "it starts with 'K' and is " + str(len(stripped)) + " characters, which is the shape of "
-            "the applicationKey, NOT the keyID — the two are probably swapped between "
-            "B2_KEY_ID and B2_APP_KEY")
-    elif len(stripped) <= 15 and stripped:
+            "it contains capital letters or symbols, so it is not a key id — a key id is "
+            + str(25) + " lowercase hex characters. This looks like the applicationKey, which "
+            "means the two values are probably swapped between B2_KEY_ID and B2_APP_KEY")
+    elif is_hex and len(stripped) <= 15:
         notes.append(
-            "it is only " + str(len(stripped)) + " characters, which is the shape of the account id — "
+            "it is " + str(len(stripped)) + " hex characters, which is the shape of the account id — "
             "that is the master key, and the master key does not work with the S3 API")
-    elif stripped and not notes:
-        notes.append("it is " + str(len(stripped)) + " characters; a B2 application key id is normally 25")
+    elif is_hex and len(stripped) != 25:
+        notes.append("it is " + str(len(stripped)) + " characters; a B2 application key id is 25")
+    elif is_hex and not notes:
+        notes.append("it is 25 hex characters, which is the right shape — so the key itself may "
+                     "have been deleted in Backblaze, or it belongs to a different account")
 
     if not value:
         return "B2_KEY_ID is empty."

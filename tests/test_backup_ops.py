@@ -522,7 +522,9 @@ def test_an_invalid_key_names_the_master_key_trap(s3, monkeypatch):
 # natural move is to re-copy the same value, which cannot help.
 
 @pytest.mark.parametrize("value,expect", [
-    # the applicationKey pasted into the keyID box — the usual cause
+    # the applicationKey pasted into the keyID box — the usual cause.
+    # Backblaze's own example key has no leading K, so the test uses that shape.
+    ("N2Zug0evLcHDlh_L0Z0AJhiGGdY", "swapped"),
     ("K003abcdefghijklmnopqrstuvwxyz12", "swapped"),
     # the account id, i.e. the master key
     ("003abc123def", "master key"),
@@ -559,9 +561,12 @@ def test_the_description_never_prints_the_key(s3, monkeypatch):
     assert "averyrecognisable" not in e.value.detail
 
 
-def test_a_normal_looking_id_just_reports_its_length(s3, monkeypatch):
-    monkeypatch.setattr(main, "B2_KEY_ID", "003" + "a" * 22)     # 25, the normal shape
-    assert "25 characters" in main._describe_key_id()
+def test_a_correctly_shaped_id_points_somewhere_else(s3, monkeypatch):
+    """25 lowercase hex is right, so the problem is not the shape."""
+    monkeypatch.setattr(main, "B2_KEY_ID", "003" + "a" * 22)     # 25 hex
+    out = main._describe_key_id()
+    assert "right shape" in out
+    assert "deleted" in out or "different account" in out
 
 
 def test_an_empty_id_says_so(monkeypatch):

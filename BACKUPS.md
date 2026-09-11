@@ -36,13 +36,27 @@ The relay prunes per shop; this is the safety net underneath it.
 
 **App Keys → Add a New Application Key**
 
-- Name: `retailos-relay`
-- **Allow access to Bucket(s): `retailos-backups`** ← not "All"
-- Type of Access: **Read and Write**
-- Leave the file-name prefix empty (the relay writes under `backups/<account>/`)
+- **App Key Name:** `retailos-relay`
+- **Allow Access to Bucket(s):** your bucket ← not "All"
+- **Allow List All Bucket Names:** tick it. It only lets the key see bucket
+  *names*, not their contents, and the S3 API wants it on a bucket-restricted
+  key. Without it the next thing you see is `AccessDenied`.
+- **Type of Access:** **Read and Write**
+- Leave **File Name Prefix** and **Expiration Time** empty
 
-You are shown `keyID` and `applicationKey` **once**. The application key is
-never displayed again.
+You are then shown two values:
+
+| | Shape | Goes in |
+|---|---|---|
+| `keyID` | **25 lowercase hex characters** — digits and a–f only | `B2_KEY_ID` |
+| `applicationKey` | mixed upper/lower case, often an underscore | `B2_APP_KEY` |
+
+Telling them apart by the alphabet is reliable; telling them apart by a leading
+`K` is not — Backblaze's own documented example applicationKey is
+`N2Zug0evLcHDlh_L0Z0AJhiGGdY`.
+
+**The applicationKey is shown once and never again.** Copy both before leaving
+the page. If you lose it, you cannot look it up — you make a new key.
 
 Scoping the key to one bucket is the part worth being careful about: this key
 lives on a server, and a key that can reach the whole Backblaze account turns
