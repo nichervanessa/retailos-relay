@@ -432,11 +432,46 @@ def test_pasting_the_whole_KEY_equals_VALUE_line_is_named(configured, monkeypatc
     assert "VALUE box" in e.value.detail
 
 
-def test_an_endpoint_without_a_scheme_says_so(configured, monkeypatch):
-    monkeypatch.setattr(main, "B2_ENDPOINT", "s3.eu-central-003.backblazeb2.com")
+@pytest.mark.parametrize("given", [
+    "s3.eu-central-003.backblazeb2.com",              # exactly what B2's page shows
+    "https://s3.eu-central-003.backblazeb2.com",
+    "https://s3.eu-central-003.backblazeb2.com/",     # trailing slash
+    "  s3.eu-central-003.backblazeb2.com  ",          # pasted with whitespace
+])
+def test_the_endpoint_is_accepted_in_the_form_backblaze_shows_it(configured, monkeypatch, given):
+    """
+    B2's bucket page prints the endpoint with no scheme. Refusing the value the
+    screen hands you, when https is the only possible reading, is us being
+    fussy at the customer's expense.
+    """
+    monkeypatch.setattr(main, "B2_ENDPOINT", given)
+    main._check_settings()
+    assert main._effective_endpoint() == "https://s3.eu-central-003.backblazeb2.com"
+
+
+def test_something_that_is_not_an_address_is_still_refused(configured, monkeypatch):
+    monkeypatch.setattr(main, "B2_ENDPOINT", "my bucket")
     with pytest.raises(HTTPException) as e:
         main._check_settings()
-    assert "https://" in e.value.detail
+    assert "B2_ENDPOINT" in e.value.detail
+
+
+def test_the_region_can_be_left_empty_and_is_read_from_the_endpoint(configured, monkeypatch):
+    """One value written in two places is one value that can disagree."""
+    monkeypatch.setattr(main, "B2_REGION", "")
+    main._check_settings()
+    assert main._effective_region() == "eu-central-003"
+
+
+@pytest.mark.parametrize("endpoint,region", [
+    ("s3.eu-central-003.backblazeb2.com", "eu-central-003"),
+    ("s3.us-west-004.backblazeb2.com",    "us-west-004"),
+    ("https://s3.us-east-005.backblazeb2.com", "us-east-005"),
+])
+def test_the_region_is_read_from_any_b2_endpoint(configured, monkeypatch, endpoint, region):
+    monkeypatch.setattr(main, "B2_ENDPOINT", endpoint)
+    monkeypatch.setattr(main, "B2_REGION", "")
+    assert main._effective_region() == region
 
 
 def test_a_region_that_is_not_in_the_endpoint_is_caught(configured, monkeypatch):

@@ -159,6 +159,47 @@ def _pasted_with_its_own_name(name: str, value: str) -> bool:
     return value.startswith(name + "=")
 
 
+def _effective_endpoint() -> str:
+    """
+    The endpoint, accepted in the form Backblaze actually hands you.
+
+    B2's bucket page displays the endpoint as
+
+        s3.eu-central-003.backblazeb2.com
+
+    with no scheme on the front. Copying exactly what the screen shows is the
+    correct instinct, and this used to refuse it and ask for https:// — which
+    is us being fussy about a value that has exactly one possible reading.
+    There is no such thing as a plaintext B2 endpoint, so there is nothing to
+    disambiguate and nothing to ask.
+
+    A trailing slash is dropped for the same reason: it changes nothing, and
+    botocore builds a double slash into every key if it is left on.
+    """
+    value = (B2_ENDPOINT or "").strip().rstrip("/")
+    if value and not value.startswith(("http://", "https://")):
+        value = "https://" + value
+    return value
+
+
+_REGION_IN_HOST = __import__("re").compile(r"\bs3[.-]([a-z]{2}-[a-z]+-\d{3})\.")
+
+
+def _effective_region() -> str:
+    """
+    The region, taken from B2_REGION or read out of the endpoint.
+
+    The region is already written inside the endpoint — eu-central-003 in
+    s3.eu-central-003.backblazeb2.com — so asking for it a second time only
+    creates a way for the two to disagree. Set it if you want; leave it unset
+    and it is read from the address, which cannot be wrong.
+    """
+    if B2_REGION:
+        return B2_REGION.strip()
+    found = _REGION_IN_HOST.search(_effective_endpoint())
+    return found.group(1) if found else "us-west-004"
+
+
 def _check_settings():
     """Refuse clearly, before B2 gets a chance to refuse confusingly."""
     settings = (
@@ -178,20 +219,23 @@ def _check_settings():
             f"setting's own name. In the dashboard the name goes in the KEY box and only the part "
             f"AFTER the = sign goes in the VALUE box.")
 
-    if not B2_ENDPOINT.startswith(("http://", "https://")):
+    endpoint = _effective_endpoint()
+    host = endpoint.split("//", 1)[-1]
+    if "." not in host or " " in host:
         raise HTTPException(503,
-            f"Online backup is misconfigured: B2_ENDPOINT ({B2_ENDPOINT!r}) must start with "
-            f"https://, like https://s3.eu-central-003.backblazeb2.com")
+            f"Online backup is misconfigured: B2_ENDPOINT ({B2_ENDPOINT!r}) is not an address. "
+            f"Copy the Endpoint from the bucket page in Backblaze — it looks like "
+            f"s3.eu-central-003.backblazeb2.com")
 
-    # The region is part of the endpoint's host name, and B2 signs against it.
-    # Mismatched, every call comes back as a signature error that says nothing
-    # about which of the two is wrong.
-    host = B2_ENDPOINT.split("//", 1)[-1]
-    if B2_REGION and B2_REGION not in host:
+    # Only checked when it was set BY HAND. Left unset it is read out of the
+    # endpoint and cannot disagree with it. Set and wrong, B2 answers every
+    # call with a signature error that names neither of the two.
+    if B2_REGION and B2_REGION.strip() not in host:
         raise HTTPException(503,
             f"Online backup is misconfigured: B2_REGION is {B2_REGION!r} but B2_ENDPOINT is "
-            f"{B2_ENDPOINT!r}. The region is the part inside the address — for "
-            f"https://s3.eu-central-003.backblazeb2.com the region is eu-central-003.")
+            f"{endpoint!r}. The region is the part inside the address — for "
+            f"https://s3.eu-central-003.backblazeb2.com the region is eu-central-003. "
+            f"You can also leave B2_REGION empty and it is read from the address.")
 
 
 def _s3():
@@ -216,8 +260,8 @@ def _s3():
         except Exception as e:
             # Almost always B2_ENDPOINT without the https:// on the front.
             raise HTTPException(503, f"Online backup is misconfigured: B2_ENDPOINT is not a "
-                                     f"usable address ({B2_ENDPOINT!r}). It must look like "
-                                     f"https://s3.us-west-004.backblazeb2.com. [{type(e).__name__}]")
+                                     f"usable address ({B2_ENDPOINT!r}). It should look like "
+                                     f"s3.eu-central-003.backblazeb2.com. [{type(e).__name__}]")
     return _s3_client
 
 
@@ -259,7 +303,7 @@ def _b2(what: str, fn, *args, **kwargs):
             code = type(e).__name__
         reason = _B2_REASONS.get(code)
         if reason is None and "EndpointConnection" in code:
-            reason = f"the storage endpoint could not be reached — check B2_ENDPOINT ({B2_ENDPOINT!r})"
+            reason = f"the storage endpoint could not be reached — check B2_ENDPOINT ({_effective_endpoint()!r})"
         logger.error("B2 %s failed [%s]: %s", what, code, e, exc_info=True)
         if reason:
             raise HTTPException(502, f"Online backup storage refused the request: {reason}.")
@@ -994,8 +1038,8 @@ def _op_backup_check(args: dict, caller: Optional[dict]):
     out = {
         "account": account,
         "prefix": _account_prefix(account),
-        "endpoint": B2_ENDPOINT or None,
-        "region": B2_REGION or None,
+        "endpoint": _effective_endpoint() or None,
+        "region": _effective_region() or None,
         "bucket": B2_BUCKET or None,
         "key_id_set": bool(B2_KEY_ID),
         "app_key_set": bool(B2_APP_KEY),

@@ -44,8 +44,8 @@ Render → the `retailos-relay` service → **Environment**:
 
 | Key | Value |
 |---|---|
-| `B2_ENDPOINT` | `https://s3.<region>.backblazeb2.com` — shown on the bucket page as *Endpoint* |
-| `B2_REGION` | the `<region>` out of that endpoint, e.g. `us-west-004` |
+| `B2_ENDPOINT` | copy the *Endpoint* straight off the bucket page, e.g. `s3.eu-central-003.backblazeb2.com` — with or without `https://`, either is accepted |
+| `B2_REGION` | **leave empty.** It is read out of the endpoint. Set it only to override that. |
 | `B2_BUCKET` | `retailos-backups` |
 | `B2_KEY_ID` | the keyID from step 2 |
 | `B2_APP_KEY` | the applicationKey from step 2 |
@@ -63,10 +63,10 @@ Optional:
 > `https://s3...` on its own is right. The relay now catches this and names the
 > setting, but only after a deploy you could have skipped.
 >
-> `B2_REGION` must be the region that is *inside* the endpoint. For
-> `https://s3.eu-central-003.backblazeb2.com` it is `eu-central-003`. If they
-> disagree, B2 rejects every call with a signature error that says nothing
-> about which of the two is wrong.
+> `B2_REGION` is read out of the endpoint, so leave it empty. If you do set it
+> and it disagrees with the endpoint, B2 rejects every call with a signature
+> error that says nothing about which of the two is wrong — so the relay checks
+> them against each other and tells you instead.
 
 Deploy. `GET /health` should still be green; the backup operations answer `503`
 naming the missing or mistyped setting until all five are right.
