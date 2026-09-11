@@ -324,6 +324,7 @@ class Boom(Exception):
 @pytest.mark.parametrize("code,expect", [
     ("NoSuchBucket",                "B2_BUCKET"),
     ("InvalidAccessKeyId",          "B2_KEY_ID"),
+    ("InvalidAccessKeyId",          "MASTER"),
     ("SignatureDoesNotMatch",       "B2_APP_KEY"),
     ("AuthorizationHeaderMalformed", "B2_REGION"),
     ("AccessDenied",                "scoped"),
@@ -496,3 +497,20 @@ def test_the_settings_are_checked_before_any_b2_call(configured, monkeypatch):
     with pytest.raises(HTTPException) as e:
         main._op_backup_list({}, ALICE)
     assert e.value.status_code == 503
+
+
+def test_an_invalid_key_names_the_master_key_trap(s3, monkeypatch):
+    """
+    Backblaze creates a master key automatically, shows it first on the App
+    Keys page, and it does not work with the S3 API at all. The bare refusal
+    reads like a typo, so people re-copy a key that was never going to work.
+    """
+    def boom(**kw):
+        raise Boom("InvalidAccessKeyId")
+    monkeypatch.setattr(s3, "list_objects_v2", boom)
+    with pytest.raises(HTTPException) as e:
+        main._op_backup_list({}, ALICE)
+    detail = e.value.detail
+    assert "MASTER" in detail                      # names the actual cause
+    assert "Application Keys" in detail            # and where to go
+    assert "25 characters" in detail               # and how to tell them apart

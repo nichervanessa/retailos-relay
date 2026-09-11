@@ -24,6 +24,16 @@ The relay prunes per shop; this is the safety net underneath it.
 
 ## 2. Make an application key — for this bucket only
 
+> **Do not use the master key.** Backblaze creates one automatically and shows
+> it at the top of this page, and it does **not work with the S3 API at all** —
+> their documentation says so outright. It comes back as "not a valid
+> application key id", which reads like a typo and sends you re-copying a key
+> that was never going to work.
+>
+> How to tell them apart: the master key's id is your **account id**, about 12
+> characters. A real application key id is about **25** characters and starts
+> with those same 12.
+
 **App Keys → Add a New Application Key**
 
 - Name: `retailos-relay`

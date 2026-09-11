@@ -277,13 +277,29 @@ def _s3():
 # shop's data, all of it is set by us in the Render dashboard, and the person
 # reading the message is the one who can fix it. Told nothing, they have a
 # working feature and a dead screen and no thread to pull.
+# The master key is the trap. Backblaze creates one automatically, shows it at
+# the top of the App Keys page, and it is the obvious thing to reach for — and
+# it does not work with the S3 API at all. Backblaze's own documentation:
+# "The master app key that is automatically created by the system is not
+# supported in the S3-Compatible API." The refusal that comes back says only
+# that the key is invalid, which reads like a typo and sends people off
+# re-copying a key that was never going to work.
+_MASTER_KEY_HINT = (
+    "B2_KEY_ID is not a valid application key id. The most likely cause: "
+    "Backblaze's MASTER key does not work with the S3 API. Create your own key "
+    "under Account -> Application Keys -> Add a New Application Key, scoped to "
+    "the bucket with read and write, and use its keyID and applicationKey. A "
+    "real key id is about 25 characters; if yours is about 12 it is the account "
+    "id, which is the master key"
+)
+
 _B2_REASONS = {
     "NoSuchBucket":         "B2_BUCKET names a bucket that does not exist",
-    "InvalidAccessKeyId":   "B2_KEY_ID is not a valid application key id",
-    "InvalidAccessKeyID":   "B2_KEY_ID is not a valid application key id",
+    "InvalidAccessKeyId":   _MASTER_KEY_HINT,
+    "InvalidAccessKeyID":   _MASTER_KEY_HINT,
     "SignatureDoesNotMatch": "B2_APP_KEY does not match B2_KEY_ID, or B2_REGION does not match B2_ENDPOINT",
     "AuthorizationHeaderMalformed": "B2_REGION does not match B2_ENDPOINT",
-    "AccessDenied":         "the application key is not allowed to use this bucket — it must be scoped to B2_BUCKET with read and write",
+    "AccessDenied":         "the application key is not allowed to use this bucket — it must be scoped to B2_BUCKET with read and write. A key restricted to one bucket may also need the listAllBucketNames capability",
     "Unauthorized":         "B2 rejected the application key",
     "NoSuchKey":            "that backup is no longer in the bucket",
 }
