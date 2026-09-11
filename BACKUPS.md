@@ -57,8 +57,19 @@ Optional:
 | `BACKUP_KEEP` | `10` | backups kept per shop |
 | `BACKUP_QUOTA_BYTES` | `5368709120` | 5 GiB ceiling per shop |
 
+> **The mistake everybody makes.** Render has a KEY box and a VALUE box; the
+> table above prints them as one line. Paste only the right-hand side into the
+> VALUE box. `B2_ENDPOINT=https://s3...` in the value box is wrong —
+> `https://s3...` on its own is right. The relay now catches this and names the
+> setting, but only after a deploy you could have skipped.
+>
+> `B2_REGION` must be the region that is *inside* the endpoint. For
+> `https://s3.eu-central-003.backblazeb2.com` it is `eu-central-003`. If they
+> disagree, B2 rejects every call with a signature error that says nothing
+> about which of the two is wrong.
+
 Deploy. `GET /health` should still be green; the backup operations answer `503`
-naming the missing setting until all five are there.
+naming the missing or mistyped setting until all five are right.
 
 ---
 

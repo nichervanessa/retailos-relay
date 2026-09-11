@@ -395,3 +395,69 @@ def test_only_an_admin_may_run_the_diagnostic(s3, caller):
 
 def test_check_is_reachable():
     assert "backup.check" in main.HANDLERS
+
+
+# ── The settings themselves ──────────────────────────────────────────────────
+# A dashboard has a KEY box and a VALUE box; every guide prints KEY=value on one
+# line. Pasting the whole line into the value box is the obvious thing to do,
+# and only B2_ENDPOINT fails in a way that shows you what you typed.
+
+@pytest.fixture
+def configured(monkeypatch):
+    monkeypatch.setattr(main, "_s3_client", None)
+    monkeypatch.setattr(main, "B2_KEY_ID", "0035abc")
+    monkeypatch.setattr(main, "B2_APP_KEY", "K003secret")
+    monkeypatch.setattr(main, "B2_BUCKET", "retailos-backups")
+    monkeypatch.setattr(main, "B2_ENDPOINT", "https://s3.eu-central-003.backblazeb2.com")
+    monkeypatch.setattr(main, "B2_REGION", "eu-central-003")
+
+
+def test_a_correct_setup_passes_the_checks(configured):
+    main._check_settings()          # must not raise
+
+
+@pytest.mark.parametrize("name,value", [
+    ("B2_ENDPOINT", "B2_ENDPOINT=https://s3.eu-central-003.backblazeb2.com"),
+    ("B2_KEY_ID",   "B2_KEY_ID=0035abc"),
+    ("B2_APP_KEY",  "B2_APP_KEY=K003secret"),
+    ("B2_BUCKET",   "B2_BUCKET=retailos-backups"),
+    ("B2_REGION",   "B2_REGION=eu-central-003"),
+])
+def test_pasting_the_whole_KEY_equals_VALUE_line_is_named(configured, monkeypatch, name, value):
+    monkeypatch.setattr(main, name, value)
+    with pytest.raises(HTTPException) as e:
+        main._check_settings()
+    assert e.value.status_code == 503
+    assert name in e.value.detail
+    assert "VALUE box" in e.value.detail
+
+
+def test_an_endpoint_without_a_scheme_says_so(configured, monkeypatch):
+    monkeypatch.setattr(main, "B2_ENDPOINT", "s3.eu-central-003.backblazeb2.com")
+    with pytest.raises(HTTPException) as e:
+        main._check_settings()
+    assert "https://" in e.value.detail
+
+
+def test_a_region_that_is_not_in_the_endpoint_is_caught(configured, monkeypatch):
+    """The mistake B2 would otherwise report as an unexplained signature error."""
+    monkeypatch.setattr(main, "B2_REGION", "us-west-004")
+    with pytest.raises(HTTPException) as e:
+        main._check_settings()
+    assert "eu-central-003" in e.value.detail
+    assert "B2_REGION" in e.value.detail
+
+
+def test_a_missing_setting_is_still_named(configured, monkeypatch):
+    monkeypatch.setattr(main, "B2_BUCKET", "")
+    with pytest.raises(HTTPException) as e:
+        main._check_settings()
+    assert "B2_BUCKET" in e.value.detail
+
+
+def test_the_settings_are_checked_before_any_b2_call(configured, monkeypatch):
+    """_s3() must refuse on bad settings rather than building a broken client."""
+    monkeypatch.setattr(main, "B2_ENDPOINT", "B2_ENDPOINT=https://x")
+    with pytest.raises(HTTPException) as e:
+        main._op_backup_list({}, ALICE)
+    assert e.value.status_code == 503

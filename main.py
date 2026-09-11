@@ -142,16 +142,62 @@ ACCOUNT_ID_RE = __import__("re").compile(r"^[A-Za-z0-9_-]{1,128}$")
 _s3_client = None
 
 
-def _s3():
-    """The B2 client, or a 503 that says which setting is missing."""
-    global _s3_client
-    missing = [n for n, v in (
+def _pasted_with_its_own_name(name: str, value: str) -> bool:
+    """
+    Did somebody paste "B2_ENDPOINT=https://..." into the VALUE box?
+
+    A dashboard asks for a key and a value in two boxes, and a setup guide
+    prints them as KEY=value on one line. Pasting the whole line into the value
+    box is the obvious thing to do and it happens constantly.
+
+    It is worth catching by name rather than leaving to the error underneath,
+    because only ONE of the five settings fails in a way that shows you the
+    value. Do it to B2_ENDPOINT and the address is visibly wrong; do it to
+    B2_KEY_ID and B2 just says the key is invalid, which sends you off
+    regenerating a key that was fine all along.
+    """
+    return value.startswith(name + "=")
+
+
+def _check_settings():
+    """Refuse clearly, before B2 gets a chance to refuse confusingly."""
+    settings = (
         ("B2_KEY_ID", B2_KEY_ID), ("B2_APP_KEY", B2_APP_KEY),
         ("B2_BUCKET", B2_BUCKET), ("B2_ENDPOINT", B2_ENDPOINT),
-    ) if not v]
+        ("B2_REGION", B2_REGION),
+    )
+    missing = [n for n, v in settings if not v and n != "B2_REGION"]
     if missing:
         raise HTTPException(503, "Online backup is not configured on the server: "
                                  f"missing {', '.join(missing)}")
+
+    mistyped = [n for n, v in settings if _pasted_with_its_own_name(n, v)]
+    if mistyped:
+        raise HTTPException(503,
+            f"Online backup is misconfigured: the value of {', '.join(mistyped)} starts with the "
+            f"setting's own name. In the dashboard the name goes in the KEY box and only the part "
+            f"AFTER the = sign goes in the VALUE box.")
+
+    if not B2_ENDPOINT.startswith(("http://", "https://")):
+        raise HTTPException(503,
+            f"Online backup is misconfigured: B2_ENDPOINT ({B2_ENDPOINT!r}) must start with "
+            f"https://, like https://s3.eu-central-003.backblazeb2.com")
+
+    # The region is part of the endpoint's host name, and B2 signs against it.
+    # Mismatched, every call comes back as a signature error that says nothing
+    # about which of the two is wrong.
+    host = B2_ENDPOINT.split("//", 1)[-1]
+    if B2_REGION and B2_REGION not in host:
+        raise HTTPException(503,
+            f"Online backup is misconfigured: B2_REGION is {B2_REGION!r} but B2_ENDPOINT is "
+            f"{B2_ENDPOINT!r}. The region is the part inside the address — for "
+            f"https://s3.eu-central-003.backblazeb2.com the region is eu-central-003.")
+
+
+def _s3():
+    """The B2 client, or a 503 that says which setting is wrong and how."""
+    global _s3_client
+    _check_settings()
     if _s3_client is None:
         try:
             import boto3
