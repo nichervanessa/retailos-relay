@@ -12,6 +12,7 @@ Run:  cd relay && python -m pytest tests -q
 
 import datetime
 import importlib
+import json
 import sys
 import types
 from pathlib import Path
@@ -307,3 +308,90 @@ def test_no_backup_handler_reads_an_account_from_its_arguments():
         assert "_account_of(caller)" in src, f"{name} must derive its account from the token"
         assert 'args.get("account")' not in src, f"{name} must not read an account from args"
         assert 'args["account"]' not in src, f"{name} must not read an account from args"
+
+
+# ── Saying what went wrong ───────────────────────────────────────────────────
+# The first real deployment failed with "The operation could not be completed"
+# and the cause sat in a server log. These check that B2's refusals arrive as a
+# sentence naming the setting to fix.
+
+class Boom(Exception):
+    def __init__(self, code):
+        super().__init__(code)
+        self.response = {"Error": {"Code": code}}
+
+
+@pytest.mark.parametrize("code,expect", [
+    ("NoSuchBucket",                "B2_BUCKET"),
+    ("InvalidAccessKeyId",          "B2_KEY_ID"),
+    ("SignatureDoesNotMatch",       "B2_APP_KEY"),
+    ("AuthorizationHeaderMalformed", "B2_REGION"),
+    ("AccessDenied",                "scoped"),
+])
+def test_a_b2_refusal_names_the_setting_to_fix(s3, monkeypatch, code, expect):
+    def boom(**kw):
+        raise Boom(code)
+    monkeypatch.setattr(s3, "list_objects_v2", boom)
+    with pytest.raises(HTTPException) as e:
+        main._op_backup_list({}, ALICE)
+    assert e.value.status_code == 502
+    assert expect in e.value.detail
+
+
+def test_an_unrecognised_refusal_still_carries_its_code(s3, monkeypatch):
+    """So the Render log is findable even for a code we have not seen."""
+    def boom(**kw):
+        raise Boom("SomeNewB2Code")
+    monkeypatch.setattr(s3, "list_objects_v2", boom)
+    with pytest.raises(HTTPException) as e:
+        main._op_backup_list({}, ALICE)
+    assert "SomeNewB2Code" in e.value.detail
+
+
+def test_an_unreachable_endpoint_says_so(s3, monkeypatch):
+    class EndpointConnectionError(Exception):
+        pass
+
+    def boom(**kw):
+        raise EndpointConnectionError("nope")
+    monkeypatch.setattr(s3, "list_objects_v2", boom)
+    with pytest.raises(HTTPException) as e:
+        main._op_backup_list({}, ALICE)
+    assert "B2_ENDPOINT" in e.value.detail
+
+
+# ── The diagnostic ───────────────────────────────────────────────────────────
+
+def test_check_reports_a_working_setup(s3):
+    out = main._op_backup_check({}, ALICE)
+    assert out["ok"] is True
+    assert out["can_list"] and out["can_sign"]
+    assert out["prefix"] == "backups/acct-alice/"
+
+
+def test_check_never_reveals_the_credentials(s3):
+    out = main._op_backup_check({}, ALICE)
+    flat = json.dumps(out)
+    assert "id" == main.B2_KEY_ID and "key" == main.B2_APP_KEY   # what the fixture set
+    assert main.B2_APP_KEY not in flat.replace('"key_id_set"', "").replace('"app_key_set"', "")
+    assert out["key_id_set"] is True and out["app_key_set"] is True
+
+
+def test_check_reports_the_problem_rather_than_raising(s3, monkeypatch):
+    def boom(**kw):
+        raise Boom("NoSuchBucket")
+    monkeypatch.setattr(s3, "list_objects_v2", boom)
+    out = main._op_backup_check({}, ALICE)
+    assert out["can_list"] is False
+    assert "B2_BUCKET" in out["problem"]
+    assert "ok" not in out
+
+
+@pytest.mark.parametrize("caller", [CASHIER, None])
+def test_only_an_admin_may_run_the_diagnostic(s3, caller):
+    with pytest.raises(HTTPException):
+        main._op_backup_check({}, caller)
+
+
+def test_check_is_reachable():
+    assert "backup.check" in main.HANDLERS

@@ -158,15 +158,69 @@ def _s3():
             from botocore.config import Config
         except ImportError:
             raise HTTPException(503, "Online backup is not available: boto3 is not installed")
-        _s3_client = boto3.client(
-            "s3",
-            endpoint_url=B2_ENDPOINT,
-            aws_access_key_id=B2_KEY_ID,
-            aws_secret_access_key=B2_APP_KEY,
-            region_name=B2_REGION,
-            config=Config(signature_version="s3v4"),
-        )
+        try:
+            _s3_client = boto3.client(
+                "s3",
+                endpoint_url=B2_ENDPOINT,
+                aws_access_key_id=B2_KEY_ID,
+                aws_secret_access_key=B2_APP_KEY,
+                region_name=B2_REGION,
+                config=Config(signature_version="s3v4"),
+            )
+        except Exception as e:
+            # Almost always B2_ENDPOINT without the https:// on the front.
+            raise HTTPException(503, f"Online backup is misconfigured: B2_ENDPOINT is not a "
+                                     f"usable address ({B2_ENDPOINT!r}). It must look like "
+                                     f"https://s3.us-west-004.backblazeb2.com. [{type(e).__name__}]")
     return _s3_client
+
+
+# ── Saying what B2 actually refused ──────────────────────────────────────────
+#
+# Every operation used to come back as "The operation could not be completed".
+# That summarising is right for the Firebase operations — they touch customer
+# records, and the shared secret is in every installer, so error text is a leak
+# waiting to happen.
+#
+# It is wrong here. Everything that goes wrong with B2 is wrong with OUR OWN
+# server configuration: a bucket name, a key, an endpoint. None of it is a
+# shop's data, all of it is set by us in the Render dashboard, and the person
+# reading the message is the one who can fix it. Told nothing, they have a
+# working feature and a dead screen and no thread to pull.
+_B2_REASONS = {
+    "NoSuchBucket":         "B2_BUCKET names a bucket that does not exist",
+    "InvalidAccessKeyId":   "B2_KEY_ID is not a valid application key id",
+    "InvalidAccessKeyID":   "B2_KEY_ID is not a valid application key id",
+    "SignatureDoesNotMatch": "B2_APP_KEY does not match B2_KEY_ID, or B2_REGION does not match B2_ENDPOINT",
+    "AuthorizationHeaderMalformed": "B2_REGION does not match B2_ENDPOINT",
+    "AccessDenied":         "the application key is not allowed to use this bucket — it must be scoped to B2_BUCKET with read and write",
+    "Unauthorized":         "B2 rejected the application key",
+    "NoSuchKey":            "that backup is no longer in the bucket",
+}
+
+
+def _b2(what: str, fn, *args, **kwargs):
+    """Run one B2 call and turn a failure into a sentence that names the fix."""
+    try:
+        return fn(*args, **kwargs)
+    except HTTPException:
+        raise
+    except Exception as e:
+        code = ""
+        try:
+            code = e.response["Error"]["Code"]          # botocore ClientError
+        except Exception:
+            code = type(e).__name__
+        reason = _B2_REASONS.get(code)
+        if reason is None and "EndpointConnection" in code:
+            reason = f"the storage endpoint could not be reached — check B2_ENDPOINT ({B2_ENDPOINT!r})"
+        logger.error("B2 %s failed [%s]: %s", what, code, e, exc_info=True)
+        if reason:
+            raise HTTPException(502, f"Online backup storage refused the request: {reason}.")
+        # Unknown: give the code, which is safe (it is B2's, about our bucket)
+        # and is the one thing that makes the Render log findable.
+        raise HTTPException(502, f"Online backup storage could not {what} [{code}]. "
+                                 f"The relay log has the detail.")
 
 
 def _account_of(caller: dict) -> str:
@@ -202,7 +256,7 @@ def _list_backups(account: str) -> list:
         kwargs = {"Bucket": B2_BUCKET, "Prefix": prefix, "MaxKeys": 1000}
         if token:
             kwargs["ContinuationToken"] = token
-        page = _s3().list_objects_v2(**kwargs)
+        page = _b2("list the backups", _s3().list_objects_v2, **kwargs)
         for obj in page.get("Contents", []):
             items.append({
                 "key": obj["Key"],
@@ -842,6 +896,8 @@ def _op_backup_upload_url(args: dict, caller: Optional[dict]):
         try:
             _s3().delete_object(Bucket=B2_BUCKET, Key=item["key"])
         except Exception as e:
+            # A backup that will not delete is not a reason to refuse to make
+            # the next one. It is pruned again tomorrow.
             logger.warning("could not prune %s: %s", item["key"], e)
     kept = existing[:max(BACKUP_KEEP - 1, 0)]
 
@@ -856,7 +912,7 @@ def _op_backup_upload_url(args: dict, caller: Optional[dict]):
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
     key = f"{_account_prefix(account)}retailos-{stamp}.db.gz"
 
-    url = _s3().generate_presigned_url(
+    url = _b2("prepare the upload", _s3().generate_presigned_url,
         "put_object",
         Params={"Bucket": B2_BUCKET, "Key": key, "ContentType": "application/gzip"},
         ExpiresIn=BACKUP_URL_TTL,
@@ -869,6 +925,58 @@ def _op_backup_upload_url(args: dict, caller: Optional[dict]):
         "expires_in": BACKUP_URL_TTL,
         "pruned": [i["key"] for i in doomed],
     }
+
+
+def _op_backup_check(args: dict, caller: Optional[dict]):
+    """
+    Does online backup actually work from here, and if not, which setting is wrong?
+
+    Exists because the first thing that happened on the first real deployment
+    was a shop pressing the button and being told "the operation could not be
+    completed". The cause was in a log on a server the shopkeeper has never
+    heard of. This runs the same two calls a backup runs — reach the bucket,
+    sign a URL — and reports what it finds.
+
+    Safe to expose: it reports on OUR configuration, which the caller's own
+    shop depends on, and it names no other shop and no data. It reports the
+    endpoint and bucket because those are the values being diagnosed, and
+    neither is a credential.
+    """
+    _require_admin(caller)
+    account = _account_of(caller)
+
+    out = {
+        "account": account,
+        "prefix": _account_prefix(account),
+        "endpoint": B2_ENDPOINT or None,
+        "region": B2_REGION or None,
+        "bucket": B2_BUCKET or None,
+        "key_id_set": bool(B2_KEY_ID),
+        "app_key_set": bool(B2_APP_KEY),
+        "keep": BACKUP_KEEP,
+    }
+    try:
+        items = _list_backups(account)
+        out["can_list"] = True
+        out["backups"] = len(items)
+    except HTTPException as e:
+        out["can_list"] = False
+        out["problem"] = e.detail
+        return out
+
+    try:
+        _b2("prepare the upload", _s3().generate_presigned_url, "put_object",
+            Params={"Bucket": B2_BUCKET, "Key": f"{_account_prefix(account)}.probe",
+                    "ContentType": "application/gzip"},
+            ExpiresIn=60)
+        out["can_sign"] = True
+    except HTTPException as e:
+        out["can_sign"] = False
+        out["problem"] = e.detail
+        return out
+
+    out["ok"] = True
+    return out
 
 
 def _op_backup_list(args: dict, caller: Optional[dict]):
@@ -890,7 +998,7 @@ def _op_backup_download_url(args: dict, caller: Optional[dict]):
     account = _account_of(caller)
     key = _own_key_or_403(account, args.get("key"))
 
-    url = _s3().generate_presigned_url(
+    url = _b2("prepare the download", _s3().generate_presigned_url,
         "get_object",
         Params={"Bucket": B2_BUCKET, "Key": key},
         ExpiresIn=BACKUP_URL_TTL,
@@ -903,7 +1011,7 @@ def _op_backup_delete(args: dict, caller: Optional[dict]):
     _require_admin(caller)
     account = _account_of(caller)
     key = _own_key_or_403(account, args.get("key"))
-    _s3().delete_object(Bucket=B2_BUCKET, Key=key)
+    _b2("delete the backup", _s3().delete_object, Bucket=B2_BUCKET, Key=key)
     return {"deleted": key}
 
 
@@ -923,6 +1031,7 @@ HANDLERS = {
     "fs.set": _op_fs_set,
     "backup.upload_url": _op_backup_upload_url,
     "backup.list": _op_backup_list,
+    "backup.check": _op_backup_check,
     "backup.download_url": _op_backup_download_url,
     "backup.delete": _op_backup_delete,
 }
