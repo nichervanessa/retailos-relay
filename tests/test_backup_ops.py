@@ -514,3 +514,56 @@ def test_an_invalid_key_names_the_master_key_trap(s3, monkeypatch):
     assert "MASTER" in detail                      # names the actual cause
     assert "Application Keys" in detail            # and where to go
     assert "25 characters" in detail               # and how to tell them apart
+
+
+# ── "Malformed Access Key Id" ────────────────────────────────────────────────
+# B2 rejects the SHAPE before it looks the key up, so the useful question is
+# what is in the box, not whether the key is right. Told only "invalid", the
+# natural move is to re-copy the same value, which cannot help.
+
+@pytest.mark.parametrize("value,expect", [
+    # the applicationKey pasted into the keyID box — the usual cause
+    ("K003abcdefghijklmnopqrstuvwxyz12", "swapped"),
+    # the account id, i.e. the master key
+    ("003abc123def", "master key"),
+    # stray whitespace from a clipboard
+    ("  003abc123def456ghi789jkl  ", "spaces or a line break"),
+    # pasted with a label
+    ("keyID: 003abc123def456ghi789jkl", "':' or '='"),
+    # quoted
+    ('"003abc123def456ghi789jkl"', "quotes or a tab"),
+])
+def test_the_error_describes_what_is_actually_in_the_box(s3, monkeypatch, value, expect):
+    monkeypatch.setattr(main, "B2_KEY_ID", value)
+
+    def boom(**kw):
+        raise Boom("InvalidAccessKeyId")
+    monkeypatch.setattr(s3, "list_objects_v2", boom)
+
+    with pytest.raises(HTTPException) as e:
+        main._op_backup_list({}, ALICE)
+    assert expect in e.value.detail
+
+
+def test_the_description_never_prints_the_key(s3, monkeypatch):
+    secret = "K003averyrecognisablesecretvalue"
+    monkeypatch.setattr(main, "B2_KEY_ID", secret)
+
+    def boom(**kw):
+        raise Boom("InvalidAccessKeyId")
+    monkeypatch.setattr(s3, "list_objects_v2", boom)
+
+    with pytest.raises(HTTPException) as e:
+        main._op_backup_list({}, ALICE)
+    assert secret not in e.value.detail
+    assert "averyrecognisable" not in e.value.detail
+
+
+def test_a_normal_looking_id_just_reports_its_length(s3, monkeypatch):
+    monkeypatch.setattr(main, "B2_KEY_ID", "003" + "a" * 22)     # 25, the normal shape
+    assert "25 characters" in main._describe_key_id()
+
+
+def test_an_empty_id_says_so(monkeypatch):
+    monkeypatch.setattr(main, "B2_KEY_ID", "")
+    assert "empty" in main._describe_key_id()

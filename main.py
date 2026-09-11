@@ -305,6 +305,48 @@ _B2_REASONS = {
 }
 
 
+def _describe_key_id() -> str:
+    """
+    Say what B2_KEY_ID actually looks like, without printing it.
+
+    "Malformed Access Key Id" means B2 rejected the SHAPE and never looked the
+    key up, so the useful question is not "is this key right" but "what is in
+    that box". Told only that the key is invalid, the natural move is to
+    re-copy the same value — which is the one thing that cannot help.
+
+    Reports length and character class, never the value. A key id is not a
+    secret the way the application key is, but it is still a credential half,
+    and a relay log is not the place to put either half.
+    """
+    raw = B2_KEY_ID or ""
+    value = raw.strip()
+    notes = []
+
+    if value != raw:
+        notes.append("it has spaces or a line break around it — re-paste it with nothing extra")
+    if any(c in value for c in "'\"\n\t"):
+        notes.append("it contains quotes or a tab — paste the bare value")
+    if ":" in value or "=" in value:
+        notes.append("it contains ':' or '=' — paste only the id itself, not a label")
+
+    stripped = value.strip("'\"")
+    if stripped.startswith("K") and len(stripped) > 27:
+        notes.append(
+            "it starts with 'K' and is " + str(len(stripped)) + " characters, which is the shape of "
+            "the applicationKey, NOT the keyID — the two are probably swapped between "
+            "B2_KEY_ID and B2_APP_KEY")
+    elif len(stripped) <= 15 and stripped:
+        notes.append(
+            "it is only " + str(len(stripped)) + " characters, which is the shape of the account id — "
+            "that is the master key, and the master key does not work with the S3 API")
+    elif stripped and not notes:
+        notes.append("it is " + str(len(stripped)) + " characters; a B2 application key id is normally 25")
+
+    if not value:
+        return "B2_KEY_ID is empty."
+    return "What is in B2_KEY_ID now: " + "; ".join(notes) + "."
+
+
 def _b2(what: str, fn, *args, **kwargs):
     """Run one B2 call and turn a failure into a sentence that names the fix."""
     try:
@@ -318,6 +360,11 @@ def _b2(what: str, fn, *args, **kwargs):
         except Exception:
             code = type(e).__name__
         reason = _B2_REASONS.get(code)
+        if code in ("InvalidAccessKeyId", "InvalidAccessKeyID"):
+            # The shape of what we were handed is the fastest route to the
+            # cause, and it is the one thing the person cannot see from B2's
+            # side or from the Render dashboard.
+            reason = f"{reason} — {_describe_key_id()}"
         if reason is None and "EndpointConnection" in code:
             reason = f"the storage endpoint could not be reached — check B2_ENDPOINT ({_effective_endpoint()!r})"
         logger.error("B2 %s failed [%s]: %s", what, code, e, exc_info=True)
